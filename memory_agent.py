@@ -34,6 +34,15 @@ from mem0 import Memory
 from config import MEM0_CONFIG, CHAT_MODEL
 
 USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+FAVORITE_FOOD_PATTERN = re.compile(
+    r"\bmy favou?rite food (?:is|are) (?P<food>[A-Za-z][A-Za-z -]{0,60})",
+    re.IGNORECASE,
+)
+LOVE_PATTERN = re.compile(r"\bI love (?P<thing>[A-Za-z][A-Za-z-]{0,40})\b", re.IGNORECASE)
+FAVORITE_INTENT_PATTERN = re.compile(
+    r"\bI love (?P<food>[A-Za-z][A-Za-z-]{0,40})\s+so\s+(?:that'?s|thats)\s+it\b",
+    re.IGNORECASE,
+)
 
 
 class SelfLearningAgent:
@@ -83,16 +92,32 @@ class SelfLearningAgent:
         lines = [f"- {m['memory']}" for m in memories]
         return "\n".join(lines)
 
-    def _store_exchange(self, user_message: str, assistant_message: str) -> None:
-        """Persist the exchange directly (no LLM extraction call — see
-        module docstring for why). Failures here are logged, not raised,
-        so a transient Groq/mem0 hiccup never crashes the chat turn."""
-        conversation = [
-            {"role": "user", "content": user_message},
-            {"role": "assistant", "content": assistant_message},
+    @staticmethod
+    def _extract_user_facts(user_message: str) -> list[str]:
+        """Create concise, searchable memories without a second LLM request."""
+        facts = []
+        favorite_food = FAVORITE_FOOD_PATTERN.search(user_message)
+        if favorite_food:
+            food = favorite_food.group("food").strip(" .,!?")
+            facts.append(f"The user's favorite food is {food}.")
+
+        favorite_intent = FAVORITE_INTENT_PATTERN.search(user_message)
+        if favorite_intent:
+            facts.append(f"The user's favorite food is {favorite_intent.group('food').strip()}.")
+
+        for loved_thing in LOVE_PATTERN.findall(user_message):
+            facts.append(f"The user loves {loved_thing.strip()}.")
+
+        return facts or [f"The user said: {user_message}"]
+
+    def _store_exchange(self, user_message: str) -> None:
+        """Persist user facts only; never store long assistant responses."""
+        memories = [
+            {"role": "user", "content": fact}
+            for fact in self._extract_user_facts(user_message)
         ]
         try:
-            self.memory.add(conversation, user_id=self.user_id, infer=False)
+            self.memory.add(memories, user_id=self.user_id, infer=False)
         except Exception as e:
             print(f"[warning] could not save this exchange to memory: {e}")
 
@@ -100,11 +125,12 @@ class SelfLearningAgent:
         context = self._retrieve_context(user_message)
 
         system_prompt = (
-            "You are a helpful, self-learning personal assistant. "
-            "You remember facts about the user across conversations and use "
-            "them naturally to personalize your answers. Do not mention "
-            "'memory' or 'database' explicitly — just use what you know.\n\n"
-            f"What you currently know about this user:\n{context}"
+            "You are a helpful personal assistant. The context below contains known "
+            "facts the user explicitly shared. Use those facts naturally. If the user "
+            "asks a direct question answered by a fact in the context, answer it "
+            "directly; do not say you do not know. Never reveal private information "
+            "unless the user asks for it.\n\n"
+            f"Known user facts:\n{context}"
         )
 
         response = self.groq_client.chat.completions.create(
@@ -120,7 +146,7 @@ class SelfLearningAgent:
         reply = response.choices[0].message.content
 
         # Learn from this exchange for next time
-        self._store_exchange(user_message, reply)
+        self._store_exchange(user_message)
 
         return reply
 
