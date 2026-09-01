@@ -127,6 +127,7 @@ docker run --rm -p 8501:8501 --env-file .env self-learning-agent
 
 ## Memory behaviour
 
-For reliable free-tier usage, memory saves the exchange directly with
-`infer=False`, avoiding an additional LLM extraction call. This means memory
-is semantic and persistent but not a perfect, deduplicated user profile.
+For reliable free-tier usage, one Groq request returns both the chat reply and
+a small list of explicit user facts. Those facts are saved with
+`infer=False`, so mem0 does not make a second LLM request. The app sends the
+saved facts back as context on later turns.

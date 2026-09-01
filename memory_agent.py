@@ -1,48 +1,17 @@
-"""
-SelfLearningAgent
-------------------
-A chat agent that remembers facts about each user across sessions using mem0,
-and gets smarter/more personalized over time as it accumulates memories.
+"""Memory-enabled chat agent with one Groq request per user message."""
 
-Flow on every turn:
-  1. Search mem0 for memories relevant to the new user message (semantic
-     search only — no LLM call, so it's free of rate-limit concerns).
-  2. Inject those memories into the system prompt as context.
-  3. Ask Groq (free LLM) for a reply.
-  4. Store the exchange in mem0 with infer=False — i.e. store it directly
-     (embed + save) instead of running mem0's own LLM-based fact-extraction
-     step first.
-
-Why infer=False: as of Groq's current free tier, every lightweight chat
-model (gpt-oss-120b, gpt-oss-20b, qwen3.6-27b, qwen3.8-27b) is capped at
-8,000 tokens per minute. mem0's default fact-extraction call uses a fairly
-large built-in prompt that alone runs ~8-9k tokens, so it can exceed that
-cap on literally any message, even a one-word one. Storing directly with
-infer=False skips that extra LLM call entirely (memory add becomes just an
-embedding + save operation), so it works reliably within the free tier.
-The trade-off: memories are the raw exchange rather than a distilled,
-deduplicated fact — still fully searchable and persists across sessions,
-which is what "self-learning" here relies on.
-"""
-
+import json
 import os
 import re
 import threading
+
 from groq import Groq
 from mem0 import Memory
 
-from config import MEM0_CONFIG, CHAT_MODEL
+from config import CHAT_MODEL, MEM0_CONFIG
 
 USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-FAVORITE_FOOD_PATTERN = re.compile(
-    r"\bmy favou?rite food (?:is|are) (?P<food>[A-Za-z][A-Za-z -]{0,60})",
-    re.IGNORECASE,
-)
-LOVE_PATTERN = re.compile(r"\bI love (?P<thing>[A-Za-z][A-Za-z-]{0,40})\b", re.IGNORECASE)
-FAVORITE_INTENT_PATTERN = re.compile(
-    r"\bI love (?P<food>[A-Za-z][A-Za-z-]{0,40})\s+so\s+(?:that'?s|thats)\s+it\b",
-    re.IGNORECASE,
-)
+MAX_CONTEXT_MEMORIES = 30
 
 
 class SelfLearningAgent:
@@ -59,79 +28,67 @@ class SelfLearningAgent:
         self.user_id = user_id
         self.memory = self._get_shared_memory()
         self.groq_client = Groq(api_key=api_key)
+        self.last_memory_error: str | None = None
 
     @classmethod
     def _get_shared_memory(cls) -> Memory:
-        """Load the embedding model once per Python process, not per rerun."""
+        """Load the local embedding model once per server process."""
         with cls._memory_lock:
             if cls._shared_memory is None:
                 cls._shared_memory = Memory.from_config(MEM0_CONFIG)
             return cls._shared_memory
 
-    def _retrieve_context(self, query: str, limit: int = 5) -> str:
-        """Search mem0 for memories relevant to the current query.
-
-        Note: current mem0ai versions require entity IDs (user_id, agent_id,
-        run_id) to be passed inside `filters={}` for search()/get_all() —
-        a top-level user_id= kwarg raises ValueError. add() is the one
-        exception and still accepts user_id directly.
-        """
+    def _get_context(self) -> str:
+        """Read saved facts directly instead of relying on semantic ranking."""
         try:
-            results = self.memory.search(
-                query=query, filters={"user_id": self.user_id}, limit=limit
-            )
-        except Exception as e:
-            print(f"[warning] memory search failed, continuing without context: {e}")
-            return "No prior memories available for this turn."
+            results = self.memory.get_all(filters={"user_id": self.user_id})
+        except Exception as error:
+            self.last_memory_error = f"Could not read memories: {error}"
+            return "No stored facts are available."
 
         memories = results.get("results", []) if isinstance(results, dict) else results
-
         if not memories:
-            return "No prior memories about this user yet."
+            return "No stored facts are available yet."
+        selected = memories[-MAX_CONTEXT_MEMORIES:]
+        return "\n".join(f"- {item['memory']}" for item in selected)
 
-        lines = [f"- {m['memory']}" for m in memories]
-        return "\n".join(lines)
+    def _save_facts(self, facts: list[str]) -> None:
+        """Persist facts without mem0 inference or an additional LLM request."""
+        clean_facts = []
+        for fact in facts:
+            if isinstance(fact, str) and fact.strip():
+                clean_facts.append(fact.strip()[:500])
+        if not clean_facts:
+            return
 
-    @staticmethod
-    def _extract_user_facts(user_message: str) -> list[str]:
-        """Create concise, searchable memories without a second LLM request."""
-        facts = []
-        favorite_food = FAVORITE_FOOD_PATTERN.search(user_message)
-        if favorite_food:
-            food = favorite_food.group("food").strip(" .,!?")
-            facts.append(f"The user's favorite food is {food}.")
-
-        favorite_intent = FAVORITE_INTENT_PATTERN.search(user_message)
-        if favorite_intent:
-            facts.append(f"The user's favorite food is {favorite_intent.group('food').strip()}.")
-
-        for loved_thing in LOVE_PATTERN.findall(user_message):
-            facts.append(f"The user loves {loved_thing.strip()}.")
-
-        return facts or [f"The user said: {user_message}"]
-
-    def _store_exchange(self, user_message: str) -> None:
-        """Persist user facts only; never store long assistant responses."""
-        memories = [
-            {"role": "user", "content": fact}
-            for fact in self._extract_user_facts(user_message)
-        ]
         try:
-            self.memory.add(memories, user_id=self.user_id, infer=False)
-        except Exception as e:
-            print(f"[warning] could not save this exchange to memory: {e}")
+            self.memory.add(
+                [{"role": "user", "content": fact} for fact in clean_facts],
+                user_id=self.user_id,
+                infer=False,
+            )
+        except Exception as error:
+            self.last_memory_error = f"Could not save memories: {error}"
 
     def chat(self, user_message: str) -> str:
-        context = self._retrieve_context(user_message)
+        user_message = user_message.strip()
+        if not user_message:
+            raise ValueError("Message cannot be empty.")
 
-        system_prompt = (
-            "You are a helpful personal assistant. The context below contains known "
-            "facts the user explicitly shared. Use those facts naturally. If the user "
-            "asks a direct question answered by a fact in the context, answer it "
-            "directly; do not say you do not know. Never reveal private information "
-            "unless the user asks for it.\n\n"
-            f"Known user facts:\n{context}"
-        )
+        self.last_memory_error = None
+        context = self._get_context()
+        system_prompt = f"""You are a helpful personal assistant.
+
+Known facts about this user:
+{context}
+
+Return a JSON object with exactly two keys:
+- "reply": your helpful answer to the user.
+- "memories": an array of 0-3 short, durable facts the user explicitly shared
+  in this message. Store preferences, personal details, goals, and important
+  constraints. Do not store questions, temporary chatter, assistant statements,
+  or inferred facts. If the user asks about a known fact above, answer directly.
+"""
 
         response = self.groq_client.chat.completions.create(
             model=CHAT_MODEL,
@@ -139,16 +96,22 @@ class SelfLearningAgent:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
-            temperature=0.4,
+            temperature=0.2,
             max_tokens=600,
+            response_format={"type": "json_object"},
         )
+        raw_content = response.choices[0].message.content or "{}"
+        try:
+            payload = json.loads(raw_content)
+            reply = str(payload["reply"]).strip()
+            facts = payload.get("memories", [])
+            if not isinstance(facts, list):
+                facts = []
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise RuntimeError(f"Groq returned an invalid structured response: {error}") from error
 
-        reply = response.choices[0].message.content
-
-        # Learn from this exchange for next time
-        self._store_exchange(user_message)
-
-        return reply
+        self._save_facts(facts)
+        return reply or "I could not generate a response."
 
     def get_all_memories(self) -> list:
         results = self.memory.get_all(filters={"user_id": self.user_id})

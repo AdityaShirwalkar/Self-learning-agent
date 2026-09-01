@@ -93,5 +93,7 @@ if prompt:
                 reply = st.session_state.agent.chat(prompt)
                 st.markdown(reply)
                 st.session_state.messages.append(("assistant", reply))
+                if st.session_state.agent.last_memory_error:
+                    st.warning(st.session_state.agent.last_memory_error)
             except Exception as error:
                 st.error(f"The request failed: {error}")
